@@ -31,6 +31,8 @@ private val midnight = Color(0xFF0A1228)
 private val panel = Color(0xDD1B2946)
 private val accent = Color(0xFF89B5FF)
 private val white = Color(0xFFF6F8FF)
+private val LocalPanel = compositionLocalOf { panel }
+private val LocalAccent = compositionLocalOf { accent }
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -67,12 +69,15 @@ fun LauncherScreen(activity: MainActivity) {
     val prefs = remember { activity.getSharedPreferences("nexora", Activity.MODE_PRIVATE) }
     var page by remember { mutableStateOf("Home") }
     var themeDark by remember { mutableStateOf(prefs.getBoolean("dark", true)) }
+    var uiMode by remember { mutableStateOf(prefs.getString("ui_mode", "balanced") ?: "balanced") }
     var showWeather by remember { mutableStateOf(prefs.getBoolean("weather", true)) }
     var clock by remember { mutableStateOf(LocalDateTime.now()) }
     var weather by remember { mutableStateOf("Weather unavailable") }
     var apps by remember { mutableStateOf(activity.installedApps()) }
     var favorite by remember { mutableStateOf(prefs.getString("favorite", "") ?: "") }
-    val background = if (themeDark) midnight else Color(0xFFE1E9F5)
+    val background = when { !themeDark -> Color(0xFFE1E9F5); uiMode == "lite" -> Color(0xFF080C14); uiMode == "premium" -> Color(0xFF101D3A); else -> midnight }
+    val activePanel = when (uiMode) { "lite" -> Color(0xFF18202D); "premium" -> Color(0xCC24395C); else -> panel }
+    val activeAccent = if (uiMode == "lite") Color(0xFFAAC8ED) else accent
     val foreground = if (themeDark) white else Color(0xFF172442)
     LaunchedEffect(Unit) { while (true) { clock = LocalDateTime.now(); delay(30_000) } }
     LaunchedEffect(showWeather) {
@@ -89,6 +94,7 @@ fun LauncherScreen(activity: MainActivity) {
             }
         }
     }
+    CompositionLocalProvider(LocalPanel provides activePanel, LocalAccent provides activeAccent) {
     Column(Modifier.fillMaxSize().background(background).padding(horizontal = 28.dp, vertical = 18.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             Text("NEXORA TV", color = foreground, fontSize = 24.sp, fontWeight = FontWeight.Bold)
@@ -136,12 +142,23 @@ fun LauncherScreen(activity: MainActivity) {
             FocusTile("Android Settings", onClick = { activity.startActivity(Intent(Settings.ACTION_SETTINGS)) })
         } else {
             Section("Appearance & Preferences", foreground)
+            Text("Performance mode (saved on device)", color = foreground)
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                listOf("lite", "balanced", "premium").forEach { mode ->
+                    FocusTile(mode.replaceFirstChar { it.uppercase() }, selected = uiMode == mode, onClick = {
+                        uiMode = mode
+                        prefs.edit().putString("ui_mode", mode).apply()
+                    })
+                }
+            }
+            Text("Lite uses opaque dark cards; Balanced uses subtle glass; Premium uses richer translucent panels. All modes avoid real-time blur.", color = foreground, fontSize = 12.sp)
             FocusTile("Theme: ${if (themeDark) "Dark" else "Light"}", onClick = { themeDark = !themeDark; prefs.edit().putBoolean("dark", themeDark).apply() })
             FocusTile("Weather: ${if (showWeather) "On" else "Off"}", onClick = { showWeather = !showWeather; prefs.edit().putBoolean("weather", showWeather).apply() })
             Text("Ambient screensaver: select Nexora Ambient in your TV's screensaver settings if supported.", color = foreground)
             Text("Daily wallpaper, location settings and advanced widget layouts are upcoming features.", color = foreground)
         }
         Text("D-pad: Navigate   •   OK: Open   •   Long OK: Favorite app   •   Back: Exit", fontSize = 12.sp, color = foreground.copy(alpha = .65f))
+    }
     }
 }
 
@@ -153,8 +170,8 @@ private fun isConnected(activity: Activity): Boolean {
 @Composable private fun Section(text: String, color: Color) { Text(text, fontSize = 20.sp, color = color, fontWeight = FontWeight.SemiBold) }
 
 @Composable private fun InfoPanel(modifier: Modifier, label: String, value: String, detail: String) {
-    Column(modifier.clip(RoundedCornerShape(18.dp)).background(panel).border(1.dp, Color(0xFF435A86), RoundedCornerShape(18.dp)).padding(18.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        Text(label, fontSize = 12.sp, color = accent)
+    Column(modifier.clip(RoundedCornerShape(18.dp)).background(LocalPanel.current).border(1.dp, Color(0xFF435A86), RoundedCornerShape(18.dp)).padding(18.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text(label, fontSize = 12.sp, color = LocalAccent.current)
         Text(value, fontSize = 24.sp, color = white, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
         Text(detail, fontSize = 12.sp, color = white.copy(alpha = .75f), maxLines = 1)
     }
@@ -166,8 +183,8 @@ private fun isConnected(activity: Activity): Boolean {
     Box(Modifier.width(if (large) 154.dp else 112.dp).height(if (large) 90.dp else 48.dp)
         .onFocusChanged { focused = it.isFocused }
         .clip(RoundedCornerShape(14.dp))
-        .background(if (focused || selected) Color(0xFF304D88) else panel)
-        .border(if (focused) 3.dp else 1.dp, if (focused) accent else Color(0xFF435A86), RoundedCornerShape(14.dp))
+        .background(if (focused || selected) Color(0xFF304D88) else LocalPanel.current)
+        .border(if (focused) 3.dp else 1.dp, if (focused) LocalAccent.current else Color(0xFF435A86), RoundedCornerShape(14.dp))
         .combinedClickable(onClick = onClick, onLongClick = onLongClick), contentAlignment = Alignment.Center) {
         Text(label, fontSize = if (large) 16.sp else 14.sp, fontWeight = FontWeight.Medium, color = white, maxLines = 2, overflow = TextOverflow.Ellipsis)
     }
