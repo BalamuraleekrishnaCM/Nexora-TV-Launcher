@@ -103,7 +103,10 @@ fun LauncherScreen(activity: MainActivity) {
     LaunchedEffect(Unit) { while (true) { clock = LocalDateTime.now(); delay(30_000) } }
     LaunchedEffect(showWeather) {
         if (showWeather) {
-            // User-configurable location should replace these example coordinates in a future settings screen.
+            val cached = prefs.getString("weather_cache", null)
+            if (cached != null) weather = cached
+            val lastFetch = prefs.getLong("weather_last_fetch", 0L)
+            if (cached != null && System.currentTimeMillis() - lastFetch < 60 * 60 * 1000L) return@LaunchedEffect
             weather = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                 runCatching {
                     val conn = URL("https://api.open-meteo.com/v1/forecast?latitude=9.93&longitude=76.27&current=temperature_2m&timezone=auto").openConnection().apply {
@@ -111,8 +114,9 @@ fun LauncherScreen(activity: MainActivity) {
                     }
                     val value = conn.getInputStream().bufferedReader().use { it.readText() }
                     "${JSONObject(value).getJSONObject("current").getDouble("temperature_2m").toInt()}°C · Kochi"
-                }.getOrDefault("Weather unavailable")
+                }.getOrDefault(cached ?: "Weather unavailable")
             }
+            if (weather != "Weather unavailable") prefs.edit().putString("weather_cache", weather).putLong("weather_last_fetch", System.currentTimeMillis()).apply()
         }
     }
     CompositionLocalProvider(LocalPanel provides activePanel, LocalAccent provides activeAccent) {
