@@ -725,6 +725,15 @@ private fun InputRow(activity: MainActivity) {
 
 @Composable
 private fun MediaBar(activity: MainActivity) {
+    var metadata by remember { mutableStateOf(activity.currentMedia()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            metadata = activity.currentMedia()
+            delay(1500)
+        }
+    }
+    val artwork = metadata?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
+        ?: metadata?.getBitmap(MediaMetadata.METADATA_KEY_ART)
     Row(
         Modifier.fillMaxWidth().height(116.dp)
             .clip(RoundedCornerShape(22.dp))
@@ -738,13 +747,15 @@ private fun MediaBar(activity: MainActivity) {
             Modifier.size(84.dp).clip(RoundedCornerShape(14.dp))
                 .background(Brush.linearGradient(listOf(violet, Color(0xFF1B6DB1), Color(0xFFFF8A78))))
         ) {
-            Text("♫", Modifier.align(Alignment.Center), color = white, fontSize = 34.sp)
+            if (artwork != null) {
+                Image(artwork.asImageBitmap(), contentDescription = "Album artwork", modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+            } else Text("♫", Modifier.align(Alignment.Center), color = white, fontSize = 34.sp)
         }
         Spacer(Modifier.width(18.dp))
         Column(Modifier.weight(1f)) {
             Text("NOW PLAYING", color = muted, fontSize = 10.sp, letterSpacing = 1.5.sp)
-            Text("Ready for playback", color = white, fontSize = 20.sp, fontWeight = FontWeight.Bold)
-            Text("Open a media app to begin", color = muted, fontSize = 13.sp)
+            Text(metadata?.getString(MediaMetadata.METADATA_KEY_TITLE) ?: "Ready for playback", color = white, fontSize = 20.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+            Text(metadata?.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: "Open a media app to begin", color = muted, fontSize = 13.sp, maxLines = 1)
             Spacer(Modifier.height(10.dp))
             Box(Modifier.fillMaxWidth().height(5.dp).clip(RoundedCornerShape(4.dp)).background(Color(0xFF596889)))
         }
@@ -803,6 +814,7 @@ private fun InputsPage(activity: MainActivity) {
 private fun MediaPage(activity: MainActivity, apps: List<TvApp>) {
     PageTitle("Media", "Controls are sent to the active Android media session")
     MediaBar(activity)
+    ActionTile("⚙", "Enable Now Playing access", "Allow Nexora to read active media metadata") { activity.requestMediaAccess() }
     val mediaApps = apps.filter { app ->
         listOf("youtube", "music", "spotify", "vlc", "kodi", "plex", "jiosaavn", "wynk", "prime", "netflix")
             .any { it in app.name.lowercase() || it in app.packageName.lowercase() }
