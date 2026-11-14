@@ -76,8 +76,8 @@ import kotlin.math.min
 
 private val midnight = Color(0xFF061329)
 private val deepBlue = Color(0xFF0A1C3A)
-private val panel = Color(0xA81B2B4D)
-private val panelStrong = Color(0xB8203155)
+private val panel = Color(0x601B2B4D)
+private val panelStrong = Color(0x78203155)
 private val panelEdge = Color(0xFF6585C9)
 private val neonBlue = Color(0xFF8CB6FF)
 private val electricBlue = Color(0xFF3E80FF)
@@ -96,9 +96,10 @@ class MainActivity : ComponentActivity() {
 
     fun installedApps(): List<TvApp> {
         val pm = packageManager
-        val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER)
+        val tvIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER)
+        val mobileIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
         @Suppress("DEPRECATION")
-        return pm.queryIntentActivities(intent, 0)
+        return (pm.queryIntentActivities(tvIntent, 0) + pm.queryIntentActivities(mobileIntent, 0))
             .map {
                 TvApp(
                     name = it.loadLabel(pm).toString(),
@@ -174,16 +175,15 @@ fun LauncherScreen(activity: MainActivity) {
     }
     val activePanel = when (uiMode) {
         "lite" -> Color(0xF21A263C)
-        "balanced" -> Color(0xE51B2B4D)
+        "balanced" -> Color(0x901B2B4D)
         else -> panel
     }
     val activeAccent = if (uiMode == "lite") Color(0xFFB8CCEF) else neonBlue
     val configuration = LocalConfiguration.current
     val systemDensity = LocalDensity.current
-    val designDensity = min(
-        configuration.screenWidthDp * systemDensity.density / 1745f,
-        configuration.screenHeightDp * systemDensity.density / 980f
-    )
+    // Respect Android's actual density. Artificial density scaling made the launcher
+    // overflow or render too small on TVs with nonstandard DPI settings.
+    val designDensity = systemDensity.density
 
     LaunchedEffect(Unit) {
         while (true) {
