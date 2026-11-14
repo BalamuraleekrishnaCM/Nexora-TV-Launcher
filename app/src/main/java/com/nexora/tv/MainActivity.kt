@@ -1,6 +1,13 @@
 package com.nexora.tv
 
 import android.app.Activity
+import android.app.NotificationManager
+import android.content.ComponentName
+import android.media.MediaMetadata
+import android.media.session.MediaSessionManager
+import android.provider.MediaStore
+import android.net.Uri
+import androidx.activity.result.contract.ActivityResultContracts
 import android.content.Intent
 import android.graphics.drawable.Drawable
 import android.media.AudioManager
@@ -89,6 +96,28 @@ private val LocalPanel = compositionLocalOf { panel }
 private val LocalAccent = compositionLocalOf { neonBlue }
 
 class MainActivity : ComponentActivity() {
+    private var wallpaperChanged by mutableIntStateOf(0)
+    private var selectedWallpaper by mutableStateOf<Uri?>(null)
+    private val wallpaperPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            runCatching { contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+            getSharedPreferences("nexora", MODE_PRIVATE).edit().putString("wallpaper_uri", uri.toString()).apply()
+            selectedWallpaper = uri
+            wallpaperChanged++
+        }
+    }
+    fun chooseWallpaper() = wallpaperPicker.launch(arrayOf("image/*"))
+    fun wallpaperUri(): Uri? = selectedWallpaper ?: getSharedPreferences("nexora", MODE_PRIVATE)
+        .getString("wallpaper_uri", null)?.let(Uri::parse)
+    fun currentMedia(): MediaMetadata? = runCatching {
+        val manager = getSystemService(MEDIA_SESSION_SERVICE) as MediaSessionManager
+        val component = ComponentName(this, NexoraNotificationListener::class.java)
+        manager.getActiveSessions(component).firstOrNull { it.playbackState?.state == 3 }?.metadata
+            ?: manager.getActiveSessions(component).firstOrNull()?.metadata
+    }.getOrNull()
+    fun requestMediaAccess() = runCatching {
+        startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+    }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent { LauncherScreen(this) }
@@ -146,6 +175,10 @@ fun LauncherScreen(activity: MainActivity) {
     var wallpaperOffset by remember { mutableIntStateOf(prefs.getInt("wallpaper_offset", 0)) }
     var clock by remember { mutableStateOf(LocalDateTime.now()) }
     var weather by remember { mutableStateOf("Weather unavailable") }
+    var city by remember { mutableStateOf(prefs.getString("weather_city", "Kochi") ?: "Kochi") }
+    var cityDraft by remember { mutableStateOf(city) }
+    var weatherRefresh by remember { mutableIntStateOf(0) }
+    var wallpaperRefresh by remember { mutableIntStateOf(0) }
     var apps by remember { mutableStateOf(activity.installedApps()) }
     var favorites by remember {
         mutableStateOf(prefs.getString("favorites", "")!!.split("|").filter { it.isNotBlank() })
@@ -191,7 +224,7 @@ fun LauncherScreen(activity: MainActivity) {
             delay(30_000)
         }
     }
-    LaunchedEffect(showWeather) {
+    LaunchedEffect(showWeather, city, weatherRefresh) {
         if (showWeather) {
             val cached = prefs.getString("weather_cache", null)
             if (cached != null) weather = cached
@@ -201,14 +234,22 @@ fun LauncherScreen(activity: MainActivity) {
             }
             weather = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                 runCatching {
+                    val query = java.net.URLEncoder.encode(city, "UTF-8")
+                    val geo = URL("https://geocoding-api.open-meteo.com/v1/search?name=$query&count=1").openConnection().apply {
+                        connectTimeout = 4000
+                        readTimeout = 4000
+                    }.getInputStream().bufferedReader().use { JSONObject(it.readText()) }
+                    val place = geo.getJSONArray("results").getJSONObject(0)
+                    val latitude = place.getDouble("latitude")
+                    val longitude = place.getDouble("longitude")
                     val connection = URL(
-                        "https://api.open-meteo.com/v1/forecast?latitude=9.93&longitude=76.27&current=temperature_2m&timezone=auto"
+                        "https://api.open-meteo.com/v1/forecast?latitude=$latitude&longitude=$longitude&current=temperature_2m&timezone=auto"
                     ).openConnection().apply {
                         connectTimeout = 4000
                         readTimeout = 4000
                     }
                     val body = connection.getInputStream().bufferedReader().use { it.readText() }
-                    "${JSONObject(body).getJSONObject("current").getDouble("temperature_2m").toInt()}°C · Kochi"
+                    "${JSONObject(body).getJSONObject("current").getDouble("temperature_2m").toInt()}°C · $city"
                 }.getOrDefault(cached ?: "Weather unavailable")
             }
             if (weather != "Weather unavailable") {
@@ -227,6 +268,17 @@ fun LauncherScreen(activity: MainActivity) {
     ) {
         Box(Modifier.fillMaxSize().background(midnight)) {
             MountainBackdrop(activePalette)
+            val wallpaperUri = activity.wallpaperUri()
+            if (wallpaperUri != null) {
+                val bitmap = remember(wallpaperUri, wallpaperRefresh) {
+                    runCatching {
+                        activity.contentResolver.openInputStream(wallpaperUri)?.use { stream ->
+                            android.graphics.BitmapFactory.decodeStream(stream)?.asImageBitmap()
+                        }
+                    }.getOrNull()
+                }
+                if (bitmap != null) Image(bitmap, contentDescription = null, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+            }
             Column(
                 Modifier.fillMaxSize()
                     .padding(horizontal = 36.dp, vertical = 20.dp)
@@ -263,7 +315,7 @@ fun LauncherScreen(activity: MainActivity) {
                         prefs.edit().putString("favorites", favorites.joinToString("|")).apply()
                     })
                     "Inputs" -> InputsPage(activity)
-                    "Media" -> MediaPage(activity)
+                    "Media" -> MediaPage(activity, apps)
                     "Widgets" -> WidgetsPage(
                         weather = showWeather,
                         calendar = showCalendar,
@@ -311,6 +363,14 @@ fun LauncherScreen(activity: MainActivity) {
                         onNextWallpaper = {
                             wallpaperOffset++
                             prefs.edit().putInt("wallpaper_offset", wallpaperOffset).apply()
+                        },
+                        onChooseWallpaper = { activity.chooseWallpaper(); wallpaperRefresh++ },
+                        city = cityDraft,
+                        onCityChange = { cityDraft = it },
+                        onSaveCity = {
+                            city = cityDraft.trim().ifBlank { "Kochi" }
+                            prefs.edit().putString("weather_city", city).remove("weather_cache").apply()
+                            weatherRefresh++
                         }
                     )
                 }
@@ -740,10 +800,19 @@ private fun InputsPage(activity: MainActivity) {
 }
 
 @Composable
-private fun MediaPage(activity: MainActivity) {
+private fun MediaPage(activity: MainActivity, apps: List<TvApp>) {
     PageTitle("Media", "Controls are sent to the active Android media session")
     MediaBar(activity)
-    ActionTile("♫", "Open an installed media app", "Choose a player from the Apps page") { }
+    val mediaApps = apps.filter { app ->
+        listOf("youtube", "music", "spotify", "vlc", "kodi", "plex", "jiosaavn", "wynk", "prime", "netflix")
+            .any { it in app.name.lowercase() || it in app.packageName.lowercase() }
+    }
+    if (mediaApps.isEmpty()) Text("No recognized media apps installed", color = muted)
+    mediaApps.chunked(4).forEach { group ->
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            group.forEach { app -> ActionTile("▶", app.name, "Open player") { activity.openApp(app.packageName) } }
+        }
+    }
 }
 
 @Composable
@@ -837,7 +906,11 @@ private fun SettingsPage(
     wallpaperOn: Boolean,
     onMode: (String) -> Unit,
     onWallpaper: () -> Unit,
-    onNextWallpaper: () -> Unit
+    onNextWallpaper: () -> Unit,
+    onChooseWallpaper: () -> Unit,
+    city: String,
+    onCityChange: (String) -> Unit,
+    onSaveCity: () -> Unit
 ) {
     PageTitle("Appearance & Preferences", "Saved locally on this Android TV")
     SectionTitle("Performance mode")
@@ -858,6 +931,10 @@ private fun SettingsPage(
         fontSize = 13.sp
     )
     ToggleTile("◈", "Daily background", wallpaperOn, onWallpaper)
+    ActionTile("▧", "Choose wallpaper", "Select an image from TV or USB storage", onChooseWallpaper)
+    SectionTitle("Weather city (no GPS required)")
+    androidx.compose.material3.OutlinedTextField(value = city, onValueChange = onCityChange, label = { Text("City") }, singleLine = true)
+    ActionTile("✓", "Save weather city", "Update the forecast location", onSaveCity)
     ActionTile("↻", "Next background", "Cycle to the next mountain palette", onNextWallpaper)
     Text("Ambient screensaver: select Nexora Ambient in Android TV screensaver settings.", color = muted, fontSize = 13.sp)
 }
