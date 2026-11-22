@@ -34,3 +34,24 @@ jobs:
         with:
           name: nexora-unsigned-release-apk
           path: app/build/outputs/apk/release/*-unsigned.apk
+
+      - name: Run D-pad smoke test on Android TV
+        timeout-minutes: 12
+        run: |
+          sudo chmod a+rw /dev/kvm
+          sdk_tools="$ANDROID_HOME/cmdline-tools/latest/bin"
+          image='system-images;android-34;android-tv;x86'
+          "$sdk_tools/sdkmanager" 'emulator' "$image"
+          echo no | "$sdk_tools/avdmanager" create avd --force --name nexora-tv-test --package "$image"
+          "$ANDROID_HOME/emulator/emulator" -avd nexora-tv-test -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect > "$RUNNER_TEMP/nexora-emulator.log" 2>&1 &
+          trap 'kill "$!" 2>/dev/null || true' EXIT
+          timeout 210 sh -c 'adb wait-for-device; until [ "$(adb shell getprop sys.boot_completed | tr -d "\r")" = 1 ]; do sleep 3; done'
+          adb shell input keyevent 82
+          gradle :app:connectedDebugAndroidTest --stacktrace
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: nexora-emulator-diagnostics
+          path: |
+            ${{ runner.temp }}/nexora-emulator.log
+            app/build/reports/androidTests/

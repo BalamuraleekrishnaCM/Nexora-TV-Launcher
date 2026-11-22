@@ -4,6 +4,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.media.MediaMetadata
 import android.media.session.MediaController
+import android.media.session.MediaSession
 import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
 import androidx.core.app.NotificationManagerCompat
@@ -14,9 +15,9 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 
 internal class MediaSessions(private val context: Context) : DefaultLifecycleObserver {
-    private val manager = context.getSystemService(MediaSessionManager::class.java)
+    private val manager = requireNotNull(context.getSystemService(MediaSessionManager::class.java))
     private val listenerComponent = ComponentName(context, NexoraNotificationListener::class.java)
-    private val callbacks = mutableMapOf<android.media.session.MediaSession.Token, Pair<MediaController, MediaController.Callback>>()
+    private val callbacks = mutableMapOf<MediaSession.Token, Pair<MediaController, MediaController.Callback>>()
     private val listener = MediaSessionManager.OnActiveSessionsChangedListener { update(it.orEmpty()) }
 
     var accessGranted by mutableStateOf(false)

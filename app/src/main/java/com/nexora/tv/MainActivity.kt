@@ -252,7 +252,7 @@ class MainActivity : ComponentActivity() {
     }
 
     fun tvInputs(): List<TvInputInfo> = runCatching {
-        getSystemService(TvInputManager::class.java).tvInputList
+        getSystemService(TvInputManager::class.java)?.tvInputList.orEmpty()
     }.getOrDefault(emptyList())
 
     fun openTvInput(input: TvInputInfo? = null) {
@@ -817,31 +817,38 @@ private fun AllAppsTile(onClick: () -> Unit) {
     }
 }
 
+private data class InputShortcut(
+    val key: String,
+    val icon: String,
+    val label: String,
+    val detail: String,
+    val open: () -> Unit
+)
+
 @Composable
 private fun InputRow(activity: MainActivity) {
-    val devices = remember(activity) {
-        activity.tvInputs().filter { it.isPassthroughInput }.associateBy { it.loadLabel(activity).toString() }
-    }
-    val sourceTiles = devices.keys.map { Triple("▱", it, "TV input") }
-        .ifEmpty { listOf(Triple("▱", "HDMI / AV", "Use remote Input or Source")) }
-    val inputs = listOf(Triple("▣", "Live TV", "Channels")) + sourceTiles + listOf(
-        Triple("↯", "USB Media", "Open a media file"),
-        Triple("◩", "Screen Cast", "Device casting settings")
-    )
-    LazyRow(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
-        items(inputs) { (icon, label, detail) ->
-            FocusSurface(
-                modifier = Modifier.width(205.dp).height(94.dp),
-                onClick = {
-                    when (label) {
-                        "USB Media" -> activity.browseUsb()
-                        "Screen Cast" -> activity.openIntent(Intent(Settings.ACTION_CAST_SETTINGS), "Casting settings are unavailable.")
-                        "Live TV" -> activity.openTvInput()
-                        else -> devices[label]?.let { activity.openTvInput(it) }
-                            ?: activity.feedback("Use the TV remote’s Input or Source button.")
-                    }
+    val inputs = remember(activity) {
+        val detected = activity.tvInputs().filter { it.isPassthroughInput }.map { input ->
+            val custom = input.loadCustomLabel(activity)?.toString()
+            val label = custom?.takeIf { it.isNotBlank() } ?: input.loadLabel(activity).toString()
+            InputShortcut(input.id, "▱", label, "TV input") { activity.openTvInput(input) }
+        }
+        val sources = detected.ifEmpty {
+            listOf(InputShortcut("source", "▱", "HDMI / AV", "Use remote Input or Source") {
+                activity.feedback("Use the TV remote’s Input or Source button.")
+            })
+        }
+        listOf(InputShortcut("live", "▣", "Live TV", "Channels") { activity.openTvInput() }) +
+            sources + listOf(
+                InputShortcut("usb", "↯", "USB Media", "Open a media file", activity::browseUsb),
+                InputShortcut("cast", "◩", "Screen Cast", "Device casting settings") {
+                    activity.openIntent(Intent(Settings.ACTION_CAST_SETTINGS), "Casting settings are unavailable.")
                 }
-            ) {
+            )
+    }
+    LazyRow(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+        items(inputs, key = { it.key }) { (_, icon, label, detail, open) ->
+            FocusSurface(Modifier.width(205.dp).height(94.dp), onClick = open) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(icon, color = white, fontSize = 30.sp, fontWeight = FontWeight.Bold)
                     Spacer(Modifier.width(14.dp))
@@ -1240,8 +1247,9 @@ private fun MountainBackdrop(palette: List<Color>) {
 private fun isConnected(activity: Activity): Boolean = networkLabel(activity) != "Offline"
 
 private fun networkLabel(activity: Activity): String {
-    val connectivity = activity.getSystemService(ConnectivityManager::class.java)
-    val capabilities = connectivity.getNetworkCapabilities(connectivity.activeNetwork) ?: return "Offline"
+    val connectivity = activity.getSystemService(ConnectivityManager::class.java) ?: return "Offline"
+    val network = connectivity.activeNetwork ?: return "Offline"
+    val capabilities = connectivity.getNetworkCapabilities(network) ?: return "Offline"
     return when {
         capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "Wi-Fi connected"
         capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "Ethernet connected"
