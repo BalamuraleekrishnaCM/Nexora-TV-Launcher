@@ -6,6 +6,8 @@ import java.net.URLEncoder
 import java.net.URL
 import kotlin.math.roundToInt
 
+internal const val DEFAULT_WEATHER_CITY = "Kochi, Kerala"
+
 internal data class Weather(
     val place: String,
     val temperature: Int,
@@ -40,9 +42,17 @@ internal data class Weather(
         }
 
         fun fetch(city: String): Weather {
-            val query = URLEncoder.encode(city, "UTF-8")
-            val location = readJson("https://geocoding-api.open-meteo.com/v1/search?name=$query&count=5&language=en")
-                .optJSONArray("results")?.optJSONObject(0) ?: throw UnknownWeatherCity()
+            val parts = city.split(',').map(String::trim).filter(String::isNotEmpty)
+            val name = parts.firstOrNull() ?: throw UnknownWeatherCity()
+            val regions = parts.drop(1)
+            val query = URLEncoder.encode(name, "UTF-8")
+            val results = readJson("https://geocoding-api.open-meteo.com/v1/search?name=$query&count=20&language=en")
+                .optJSONArray("results") ?: throw UnknownWeatherCity()
+            val location = (0 until results.length()).firstNotNullOfOrNull { index ->
+                val place = results.optJSONObject(index) ?: return@firstNotNullOfOrNull null
+                val labels = listOf("admin1", "admin2", "admin3", "admin4", "country", "country_code").map(place::optString)
+                place.takeIf { matchesWeatherRegion(regions, labels) }
+            } ?: throw UnknownWeatherCity()
             val latitude = location.getDouble("latitude")
             val longitude = location.getDouble("longitude")
             val forecast = readJson(
@@ -77,3 +87,6 @@ internal data class Weather(
 }
 
 internal class UnknownWeatherCity : Exception()
+
+internal fun matchesWeatherRegion(qualifiers: List<String>, labels: List<String>): Boolean =
+    qualifiers.all { qualifier -> labels.any { label -> label.equals(qualifier, ignoreCase = true) } }

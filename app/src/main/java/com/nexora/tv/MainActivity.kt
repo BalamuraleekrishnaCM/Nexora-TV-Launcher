@@ -308,7 +308,10 @@ fun LauncherScreen(activity: MainActivity) {
     val started = lifecycleState.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED)
     var tick by remember { mutableIntStateOf(0) }
     var opacity by remember { mutableIntStateOf(prefs.getInt("glass_opacity", 45).coerceIn(25, 85)) }
-    var city by remember { mutableStateOf(prefs.getString("weather_city", "Kochi") ?: "Kochi") }
+    var city by remember {
+        val savedCity = prefs.getString("weather_city", null)
+        mutableStateOf(savedCity?.takeUnless { it.equals("Kochi", ignoreCase = true) } ?: DEFAULT_WEATHER_CITY)
+    }
     var cityDraft by remember { mutableStateOf(city) }
     var weatherRefresh by remember { mutableIntStateOf(0) }
     val apps = activity.apps
@@ -503,7 +506,9 @@ fun LauncherScreen(activity: MainActivity) {
                         city = cityDraft,
                         onCityChange = { cityDraft = it },
                         onSaveCity = {
-                            city = cityDraft.trim().ifBlank { "Kochi" }
+                            val input = cityDraft.trim()
+                            city = if (input.isBlank() || input.equals("Kochi", ignoreCase = true)) DEFAULT_WEATHER_CITY else input
+                            cityDraft = city
                             prefs.edit().putString("weather_city", city).remove("weather_cache").apply()
                             weatherRefresh++
                         }
@@ -1114,7 +1119,7 @@ private fun SettingsPage(
     androidx.compose.material3.OutlinedTextField(
         value = city,
         onValueChange = { onCityChange(it.take(80)) },
-        label = { Text("City") },
+        label = { Text("City, region or country") },
         singleLine = true,
         colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(
             focusedTextColor = white, unfocusedTextColor = white,
