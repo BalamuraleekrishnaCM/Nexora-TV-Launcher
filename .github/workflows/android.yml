@@ -1,4 +1,4 @@
-name: Android debug build
+name: Android build and tests
 on:
   push:
   pull_request:
@@ -22,10 +22,15 @@ jobs:
           echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0" "platform-tools"
-      - name: Compile debug APK
-        run: gradle :app:assembleDebug --stacktrace
+      - name: Run checks and assemble APKs
+        run: gradle :app:testDebugUnitTest :app:lintDebug :app:assembleDebug :app:assembleRelease :app:assembleDebugAndroidTest --stacktrace
       - uses: actions/upload-artifact@v4
         if: success()
         with:
           name: nexora-debug-apk
           path: app/build/outputs/apk/debug/*.apk
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: nexora-unsigned-release-apk
+          path: app/build/outputs/apk/release/*-unsigned.apk

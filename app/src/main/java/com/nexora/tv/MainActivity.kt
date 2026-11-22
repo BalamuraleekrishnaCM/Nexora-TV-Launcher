@@ -1,15 +1,32 @@
 package com.nexora.tv
 
 import android.app.Activity
-import android.app.NotificationManager
-import android.content.ComponentName
 import android.media.MediaMetadata
-import android.media.session.MediaSessionManager
-import android.provider.MediaStore
 import android.net.Uri
 import androidx.activity.result.contract.ActivityResultContracts
 import android.content.Intent
-import android.graphics.drawable.Drawable
+import android.content.ActivityNotFoundException
+import android.graphics.BitmapFactory
+import android.media.session.PlaybackState
+import android.media.tv.TvContract
+import android.media.tv.TvInputInfo
+import android.media.tv.TvInputManager
+import android.net.NetworkCapabilities
+import android.widget.Toast
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.runtime.produceState
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.util.Locale
 import android.media.AudioManager
 import android.net.ConnectivityManager
 import android.os.Bundle
@@ -31,6 +48,8 @@ import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -55,6 +74,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -64,27 +85,25 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalConfiguration
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.sp
 import androidx.core.graphics.drawable.toBitmap
+import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
-import org.json.JSONObject
-import java.net.URL
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
-import kotlin.math.min
 
 private val midnight = Color(0xFF061329)
 private val deepBlue = Color(0xFF0A1C3A)
 private val panel = Color(0x601B2B4D)
-private val panelStrong = Color(0x78203155)
 private val panelEdge = Color(0xFF6585C9)
 private val neonBlue = Color(0xFF8CB6FF)
 private val electricBlue = Color(0xFF3E80FF)
@@ -93,58 +112,137 @@ private val mint = Color(0xFF35D589)
 private val white = Color(0xFFF7F8FF)
 private val muted = Color(0xFFBBC5DB)
 private val LocalPanel = compositionLocalOf { panel }
+private val LocalCompact = compositionLocalOf { false }
+private val LocalLite = compositionLocalOf { false }
 private val LocalAccent = compositionLocalOf { neonBlue }
 
 class MainActivity : ComponentActivity() {
-    private var wallpaperChanged by mutableIntStateOf(0)
-    private var selectedWallpaper by mutableStateOf<Uri?>(null)
+    private val prefs by lazy { getSharedPreferences("nexora", MODE_PRIVATE) }
+    internal val mediaSessions by lazy { MediaSessions(this) }
+    internal var apps by mutableStateOf<List<TvApp>>(emptyList())
+        private set
+    private var appScan: kotlinx.coroutines.Job? = null
+    internal var wallpaperUri by mutableStateOf<Uri?>(null)
+        private set
+
     private val wallpaperPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        if (uri != null) {
-            runCatching { contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
-            getSharedPreferences("nexora", MODE_PRIVATE).edit().putString("wallpaper_uri", uri.toString()).apply()
-            selectedWallpaper = uri
-            wallpaperChanged++
+        if (uri != null && uri != wallpaperUri) {
+            try {
+                contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                val previous = wallpaperUri
+                prefs.edit().putString("wallpaper_uri", uri.toString()).apply()
+                wallpaperUri = uri
+                releaseWallpaper(previous)
+            } catch (_: SecurityException) {
+                feedback("This provider cannot keep the image available. Choose another image.")
+            }
         }
     }
-    fun chooseWallpaper() = wallpaperPicker.launch(arrayOf("image/*"))
-    fun wallpaperUri(): Uri? = selectedWallpaper ?: getSharedPreferences("nexora", MODE_PRIVATE)
-        .getString("wallpaper_uri", null)?.let(Uri::parse)
-    fun currentMedia(): MediaMetadata? = runCatching {
-        val manager = getSystemService(MEDIA_SESSION_SERVICE) as MediaSessionManager
-        val component = ComponentName(this, NexoraNotificationListener::class.java)
-        manager.getActiveSessions(component).firstOrNull { it.playbackState?.state == 3 }?.metadata
-            ?: manager.getActiveSessions(component).firstOrNull()?.metadata
-    }.getOrNull()
-    fun requestMediaAccess() = runCatching {
-        startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+
+    fun chooseWallpaper() {
+        try {
+            wallpaperPicker.launch(arrayOf("image/*"))
+        } catch (_: ActivityNotFoundException) {
+            feedback("A document picker is unavailable on this TV.")
+        }
     }
+
+    fun resetWallpaper() {
+        val previous = wallpaperUri
+        prefs.edit().remove("wallpaper_uri").apply()
+        wallpaperUri = null
+        releaseWallpaper(previous)
+    }
+
+    private fun releaseWallpaper(uri: Uri?) {
+        if (uri != null) runCatching {
+            contentResolver.releasePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+    }
+
+    private val usbPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            openIntent(
+                Intent(Intent.ACTION_VIEW, uri)
+                    .setDataAndType(uri, contentResolver.getType(uri))
+                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION),
+                "Install a compatible media player to open this file."
+            )
+        }
+    }
+
+    fun browseUsb() {
+        try {
+            usbPicker.launch(arrayOf("video/*", "audio/*", "image/*"))
+        } catch (_: ActivityNotFoundException) {
+            feedback("A document picker is unavailable on this TV.")
+        }
+    }
+
+    fun requestMediaAccess() {
+        openIntent(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS), "Open notification access in device settings.")
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        wallpaperUri = prefs.getString("wallpaper_uri", null)?.let(Uri::parse)
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        WindowCompat.getInsetsController(window, window.decorView).apply {
+            systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            hide(WindowInsetsCompat.Type.systemBars())
+        }
+        lifecycle.addObserver(mediaSessions)
         setContent { LauncherScreen(this) }
     }
 
-    fun installedApps(): List<TvApp> {
+    override fun onResume() {
+        super.onResume()
+        refreshApps()
+    }
+
+    fun refreshApps() {
+        appScan?.cancel()
+        appScan = lifecycleScope.launch {
+            apps = withContext(Dispatchers.IO) { installedApps() }
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun installedApps(): List<TvApp> {
         val pm = packageManager
         val tvIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER)
         val mobileIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
-        @Suppress("DEPRECATION")
         return (pm.queryIntentActivities(tvIntent, 0) + pm.queryIntentActivities(mobileIntent, 0))
+            .filter { it.activityInfo.packageName != packageName }
+            .distinctBy { it.activityInfo.packageName }
             .map {
                 TvApp(
                     name = it.loadLabel(pm).toString(),
-                    packageName = it.activityInfo.packageName,
-                    artwork = it.activityInfo.loadBanner(pm) ?: it.loadIcon(pm)
+                    component = ComponentName(it.activityInfo.packageName, it.activityInfo.name),
+                    resolveInfo = it
                 )
             }
-            .filter { it.packageName != packageName }
-            .distinctBy { it.packageName }
-            .sortedBy { it.name.lowercase() }
+            .sortedBy { it.name.lowercase(Locale.ROOT) }
     }
 
     fun openApp(packageName: String) {
-        val launch = packageManager.getLeanbackLaunchIntentForPackage(packageName)
-            ?: packageManager.getLaunchIntentForPackage(packageName)
-        if (launch != null) runCatching { startActivity(launch) }
+        val app = apps.firstOrNull { it.packageName == packageName } ?: return
+        val launch = Intent(Intent.ACTION_MAIN).setComponent(app.component).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        openIntent(launch, "Unable to open ${app.name}. Refresh the app list.")
+    }
+
+    internal fun openIntent(intent: Intent, fallback: String) {
+        try {
+            startActivity(intent)
+        } catch (_: ActivityNotFoundException) {
+            feedback(fallback)
+        } catch (_: SecurityException) {
+            feedback(fallback)
+        }
+    }
+
+    internal fun feedback(message: String) {
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show()
     }
 
     fun mediaKey(code: Int) {
@@ -153,19 +251,48 @@ class MainActivity : ComponentActivity() {
         audio.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, code))
     }
 
-    fun openTvInput() {
+    fun tvInputs(): List<TvInputInfo> = runCatching {
+        getSystemService(TvInputManager::class.java).tvInputList
+    }.getOrDefault(emptyList())
+
+    fun openTvInput(input: TvInputInfo? = null) {
+        val fallback = "Use the TV remote’s Input or Source button."
+        if (input?.isPassthroughInput == true) {
+            openIntent(Intent(Intent.ACTION_VIEW, TvContract.buildChannelUriForPassthroughInput(input.id)), fallback)
+            return
+        }
         val candidates = listOf("com.google.android.tv", "com.android.tv", "com.xiaomi.mitv.tvplayer")
-        val target = candidates.firstOrNull { packageManager.getLaunchIntentForPackage(it) != null }
-        if (target != null) openApp(target) else runCatching { startActivity(Intent(Settings.ACTION_SETTINGS)) }
+        val launch = candidates.firstNotNullOfOrNull {
+            packageManager.getLeanbackLaunchIntentForPackage(it) ?: packageManager.getLaunchIntentForPackage(it)
+        }
+        if (launch == null) feedback(fallback) else openIntent(launch, fallback)
     }
 }
 
-data class TvApp(val name: String, val packageName: String, val artwork: Drawable?)
+data class TvApp(val name: String, val component: ComponentName, val resolveInfo: android.content.pm.ResolveInfo) {
+    val packageName: String get() = component.packageName
+}
+
+private suspend fun decodeArtwork(activity: Activity, uri: Uri?, limit: Int): ImageBitmap? =
+    withContext(Dispatchers.IO) {
+        if (uri == null || uri.scheme !in setOf("content", "android.resource")) return@withContext null
+        runCatching {
+            val resolver = activity.contentResolver
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return@runCatching null
+            val options = BitmapFactory.Options().apply {
+                inSampleSize = 1
+                while (maxOf(bounds.outWidth, bounds.outHeight) / inSampleSize > limit * 2) inSampleSize *= 2
+            }
+            resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, options)?.asImageBitmap() }
+        }.getOrNull()
+    }
 
 @Composable
 fun LauncherScreen(activity: MainActivity) {
     val prefs = remember { activity.getSharedPreferences("nexora", Activity.MODE_PRIVATE) }
-    var page by remember { mutableStateOf("Home") }
+    var page by rememberSaveable { mutableStateOf("Home") }
     var uiMode by remember { mutableStateOf(prefs.getString("ui_mode", "premium") ?: "premium") }
     var showWeather by remember { mutableStateOf(prefs.getBoolean("weather", true)) }
     var showCalendar by remember { mutableStateOf(prefs.getBoolean("calendar", true)) }
@@ -174,12 +301,16 @@ fun LauncherScreen(activity: MainActivity) {
     var wallpaperOn by remember { mutableStateOf(prefs.getBoolean("daily_wallpaper", true)) }
     var wallpaperOffset by remember { mutableIntStateOf(prefs.getInt("wallpaper_offset", 0)) }
     var clock by remember { mutableStateOf(LocalDateTime.now()) }
-    var weather by remember { mutableStateOf("Weather unavailable") }
+    var weather by remember { mutableStateOf<Weather?>(null) }
+    var weatherStatus by remember { mutableStateOf("") }
+    val lifecycleState by activity.lifecycle.currentStateFlow.collectAsState()
+    val started = lifecycleState.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED)
+    var tick by remember { mutableIntStateOf(0) }
+    var opacity by remember { mutableIntStateOf(prefs.getInt("glass_opacity", 45).coerceIn(25, 85)) }
     var city by remember { mutableStateOf(prefs.getString("weather_city", "Kochi") ?: "Kochi") }
     var cityDraft by remember { mutableStateOf(city) }
     var weatherRefresh by remember { mutableIntStateOf(0) }
-    var wallpaperRefresh by remember { mutableIntStateOf(0) }
-    var apps by remember { mutableStateOf(activity.installedApps()) }
+    val apps = activity.apps
     var favorites by remember {
         mutableStateOf(prefs.getString("favorites", "")!!.split("|").filter { it.isNotBlank() })
     }
@@ -207,81 +338,76 @@ fun LauncherScreen(activity: MainActivity) {
         listOf(midnight, deepBlue, Color(0xFF162447))
     }
     val activePanel = when (uiMode) {
-        "lite" -> Color(0xF21A263C)
-        "balanced" -> Color(0x901B2B4D)
-        else -> panel
+        "lite" -> Color(0xFF1A263C)
+        "balanced" -> panel.copy(alpha = (opacity + 12).coerceAtMost(95) / 100f)
+        else -> panel.copy(alpha = opacity / 100f)
     }
     val activeAccent = if (uiMode == "lite") Color(0xFFB8CCEF) else neonBlue
-    val configuration = LocalConfiguration.current
-    val systemDensity = LocalDensity.current
-    // Respect Android's actual density. Artificial density scaling made the launcher
-    // overflow or render too small on TVs with nonstandard DPI settings.
-    val designDensity = systemDensity.density
 
-    LaunchedEffect(Unit) {
+    BackHandler(page != "Home") { page = "Home" }
+    LaunchedEffect(started) {
+        if (!started) return@LaunchedEffect
         while (true) {
             clock = LocalDateTime.now()
+            tick++
             delay(30_000)
         }
     }
-    LaunchedEffect(showWeather, city, weatherRefresh) {
-        if (showWeather) {
-            val cached = prefs.getString("weather_cache", null)
-            if (cached != null) weather = cached
-            val lastFetch = prefs.getLong("weather_last_fetch", 0L)
-            if (cached != null && System.currentTimeMillis() - lastFetch < 60 * 60 * 1000L) {
-                return@LaunchedEffect
+    LaunchedEffect(started, showWeather, city, weatherRefresh, tick / 60) {
+        if (!started || !showWeather) return@LaunchedEffect
+        val key = "weather_v2_" + city.lowercase(Locale.ROOT)
+        val cached = prefs.getString(key, null)?.let { runCatching { Weather.fromJson(it) }.getOrNull() }
+        weather = cached
+        val age = System.currentTimeMillis() - prefs.getLong("${key}_time", 0L)
+        weatherStatus = ""
+        if (cached != null && age in 0 until 1_800_000L) return@LaunchedEffect
+        weatherStatus = if (cached == null) "Fetching weather" else "Cached weather"
+        val result = withContext(Dispatchers.IO) {
+            try {
+                Result.success(Weather.fetch(city))
+            } catch (e: java.io.IOException) {
+                Result.failure(e)
+            } catch (e: org.json.JSONException) {
+                Result.failure(e)
+            } catch (e: UnknownWeatherCity) {
+                Result.failure(e)
             }
-            weather = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                runCatching {
-                    val query = java.net.URLEncoder.encode(city, "UTF-8")
-                    val geo = URL("https://geocoding-api.open-meteo.com/v1/search?name=$query&count=1").openConnection().apply {
-                        connectTimeout = 4000
-                        readTimeout = 4000
-                    }.getInputStream().bufferedReader().use { JSONObject(it.readText()) }
-                    val place = geo.getJSONArray("results").getJSONObject(0)
-                    val latitude = place.getDouble("latitude")
-                    val longitude = place.getDouble("longitude")
-                    val connection = URL(
-                        "https://api.open-meteo.com/v1/forecast?latitude=$latitude&longitude=$longitude&current=temperature_2m&timezone=auto"
-                    ).openConnection().apply {
-                        connectTimeout = 4000
-                        readTimeout = 4000
-                    }
-                    val body = connection.getInputStream().bufferedReader().use { it.readText() }
-                    "${JSONObject(body).getJSONObject("current").getDouble("temperature_2m").toInt()}°C · $city"
-                }.getOrDefault(cached ?: "Weather unavailable")
-            }
-            if (weather != "Weather unavailable") {
-                prefs.edit()
-                    .putString("weather_cache", weather)
-                    .putLong("weather_last_fetch", System.currentTimeMillis())
-                    .apply()
+        }
+        result.onSuccess {
+            weather = it
+            weatherStatus = ""
+            prefs.edit().putString(key, it.toJson()).putLong("${key}_time", System.currentTimeMillis()).apply()
+        }.onFailure {
+            weatherStatus = when {
+                it is UnknownWeatherCity -> "City not found"
+                cached != null -> "Cached weather"
+                else -> "Weather unavailable"
             }
         }
     }
 
-    CompositionLocalProvider(
-        LocalPanel provides activePanel,
-        LocalAccent provides activeAccent,
-        LocalDensity provides Density(designDensity, systemDensity.fontScale)
-    ) {
-        Box(Modifier.fillMaxSize().background(midnight)) {
-            MountainBackdrop(activePalette)
-            val wallpaperUri = activity.wallpaperUri()
-            if (wallpaperUri != null) {
-                val bitmap = remember(wallpaperUri, wallpaperRefresh) {
-                    runCatching {
-                        activity.contentResolver.openInputStream(wallpaperUri)?.use { stream ->
-                            android.graphics.BitmapFactory.decodeStream(stream)?.asImageBitmap()
-                        }
-                    }.getOrNull()
-                }
-                if (bitmap != null) Image(bitmap, contentDescription = null, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+    val wallpaperUri = if (uiMode == "lite") null else activity.wallpaperUri
+    val customWallpaper by produceState<ImageBitmap?>(null, wallpaperUri) {
+        value = null
+        value = decodeArtwork(activity, wallpaperUri, 1920)
+    }
+    BoxWithConstraints(Modifier.fillMaxSize().background(midnight)) {
+        val compact = maxWidth < 1050.dp
+        CompositionLocalProvider(
+            LocalPanel provides activePanel,
+            LocalAccent provides activeAccent,
+            LocalCompact provides compact,
+            LocalLite provides (uiMode == "lite")
+        ) {
+            if (customWallpaper == null && uiMode != "lite") MountainBackdrop(activePalette)
+            customWallpaper?.let {
+                Image(it, contentDescription = null, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = .28f)))
             }
             Column(
                 Modifier.fillMaxSize()
-                    .padding(horizontal = 36.dp, vertical = 20.dp)
+                    .windowInsetsPadding(WindowInsets.safeDrawing)
+                    .padding(horizontal = if (compact) 18.dp else 36.dp, vertical = 16.dp)
                     .verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
@@ -291,6 +417,8 @@ fun LauncherScreen(activity: MainActivity) {
                         activity = activity,
                         clock = clock,
                         weather = weather,
+                        city = city,
+                        weatherStatus = weatherStatus,
                         apps = apps,
                         favorites = favorites,
                         showWeather = showWeather,
@@ -309,7 +437,7 @@ fun LauncherScreen(activity: MainActivity) {
                         onPage = { page = it }
                     )
                     "Apps" -> AppsPage(activity, apps, favorites, onRefresh = {
-                        apps = activity.installedApps()
+                        activity.refreshApps()
                     }, onToggleFavorite = { packageName ->
                         favorites = if (favorites.contains(packageName)) favorites - packageName else favorites + packageName
                         prefs.edit().putString("favorites", favorites.joinToString("|")).apply()
@@ -364,7 +492,13 @@ fun LauncherScreen(activity: MainActivity) {
                             wallpaperOffset++
                             prefs.edit().putInt("wallpaper_offset", wallpaperOffset).apply()
                         },
-                        onChooseWallpaper = { activity.chooseWallpaper(); wallpaperRefresh++ },
+                        onChooseWallpaper = activity::chooseWallpaper,
+                        onResetWallpaper = activity::resetWallpaper,
+                        opacity = opacity,
+                        onOpacity = {
+                            opacity = (opacity + it).coerceIn(25, 85)
+                            prefs.edit().putInt("glass_opacity", opacity).apply()
+                        },
                         city = cityDraft,
                         onCityChange = { cityDraft = it },
                         onSaveCity = {
@@ -382,6 +516,8 @@ fun LauncherScreen(activity: MainActivity) {
 
 @Composable
 private fun LauncherHeader(page: String, clock: LocalDateTime, connected: Boolean, onPage: (String) -> Unit) {
+    val initialFocus = remember { FocusRequester() }
+    LaunchedEffect(Unit) { initialFocus.requestFocus() }
     val tabs = listOf(
         "⌂" to "Home",
         "▦" to "Apps",
@@ -390,30 +526,25 @@ private fun LauncherHeader(page: String, clock: LocalDateTime, connected: Boolea
         "◇" to "Widgets",
         "⚙" to "Settings"
     )
-    Row(
-        Modifier.fillMaxWidth().height(66.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(14.dp)
-    ) {
-        Row(Modifier.width(292.dp), verticalAlignment = Alignment.CenterVertically) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             NexoraMark()
-            Spacer(Modifier.width(14.dp))
-            Column {
-                Text("NEXORA TV", color = white, fontSize = 22.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
-                Text("TV LAUNCHER", color = muted, fontSize = 10.sp, letterSpacing = 2.sp)
+            Spacer(Modifier.width(10.dp))
+            Text("NEXORA TV", color = white, fontSize = 21.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.weight(1f))
+            Column(horizontalAlignment = Alignment.End) {
+                Text(clock.format(DateTimeFormatter.ofPattern("h:mm a")), color = white, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                Text(if (connected) "Online" else "Offline", color = muted, fontSize = 12.sp)
             }
         }
-        tabs.forEach { (icon, label) ->
-            NavButton(icon, label, selected = page == label, onClick = { onPage(label) })
-        }
-        Spacer(Modifier.weight(1f))
-        Column(horizontalAlignment = Alignment.End) {
-            Text(clock.format(DateTimeFormatter.ofPattern("h:mm a")), color = white, fontSize = 24.sp, fontWeight = FontWeight.Bold)
-            Text(
-                (if (connected) "● Online  ·  " else "○ Offline  ·  ") + clock.format(DateTimeFormatter.ofPattern("EEE, d MMM")),
-                color = if (connected) muted else Color(0xFFFFA6A6),
-                fontSize = 11.sp
-            )
+        LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            items(tabs, key = { it.second }) { (icon, label) ->
+                NavButton(
+                    icon, label, selected = page == label,
+                    modifier = if (label == "Home") Modifier.focusRequester(initialFocus) else Modifier,
+                    onClick = { onPage(label) }
+                )
+            }
         }
     }
 }
@@ -451,15 +582,15 @@ private fun NexoraMark() {
 }
 
 @Composable
-private fun NavButton(icon: String, label: String, selected: Boolean, onClick: () -> Unit) {
+private fun NavButton(icon: String, label: String, selected: Boolean, modifier: Modifier, onClick: () -> Unit) {
     FocusSurface(
-        modifier = Modifier.width(if (label == "Settings") 142.dp else 128.dp).height(54.dp),
+        modifier = modifier.width(if (LocalCompact.current) 106.dp else 128.dp).height(50.dp),
         selected = selected,
         onClick = onClick
     ) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.Center) {
-            Text(icon, color = white, fontSize = 24.sp)
-            Spacer(Modifier.width(9.dp))
+            Text(icon, color = white, fontSize = 18.sp)
+            Spacer(Modifier.width(5.dp))
             Text(label, color = white, fontSize = 16.sp, fontWeight = FontWeight.Medium)
         }
     }
@@ -469,7 +600,9 @@ private fun NavButton(icon: String, label: String, selected: Boolean, onClick: (
 private fun HomePage(
     activity: MainActivity,
     clock: LocalDateTime,
-    weather: String,
+    weather: Weather?,
+    city: String,
+    weatherStatus: String,
     apps: List<TvApp>,
     favorites: List<String>,
     showWeather: Boolean,
@@ -480,14 +613,18 @@ private fun HomePage(
     onToggleFavorite: (String) -> Unit,
     onPage: (String) -> Unit
 ) {
-    Row(
-        Modifier.fillMaxWidth().height(190.dp),
-        horizontalArrangement = Arrangement.spacedBy(16.dp)
-    ) {
-        ClockCard(Modifier.weight(1.15f), clock)
-        if (showWeather) WeatherCard(Modifier.weight(1f), weather)
-        if (showNetwork) NetworkCard(Modifier.weight(.72f), isConnected(activity))
-        if (showCalendar) CalendarCard(Modifier.weight(1.05f), clock)
+    val compact = LocalCompact.current
+    Row(Modifier.fillMaxWidth().height(if (compact) 142.dp else 170.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        ClockCard(Modifier.weight(1f), clock)
+        if (showWeather) WeatherCard(Modifier.weight(1f), weather, city, weatherStatus)
+        if (showNetwork && !compact) NetworkCard(Modifier.weight(.72f), networkLabel(activity))
+        if (showCalendar && !compact) CalendarCard(Modifier.weight(1f), clock)
+    }
+    if (compact && (showNetwork || showCalendar)) {
+        Row(Modifier.fillMaxWidth().height(138.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            if (showNetwork) NetworkCard(Modifier.weight(1f), networkLabel(activity))
+            if (showCalendar) CalendarCard(Modifier.weight(1f), clock)
+        }
     }
 
     rowOrder.forEach { row ->
@@ -511,12 +648,10 @@ private fun FavoriteAppsRow(
     onPage: (String) -> Unit
 ) {
     SectionTitle("Favorite Apps")
-    val orderedApps = apps.sortedWith(
-        compareBy<TvApp> { if (favorites.contains(it.packageName)) 0 else 1 }
-            .thenBy { it.name.lowercase() }
-    )
+    val byPackage = apps.associateBy { it.packageName }
+    val orderedApps = favorites.mapNotNull(byPackage::get).ifEmpty { apps.take(7) }
     LazyRow(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
-        items(orderedApps.take(7), key = { it.packageName }) { app ->
+        items(orderedApps, key = { it.packageName }) { app ->
             AppTile(
                 app = app,
                 favorite = favorites.contains(app.packageName),
@@ -532,13 +667,13 @@ private fun FavoriteAppsRow(
 private fun ClockCard(modifier: Modifier, clock: LocalDateTime) {
     GlassPanel(
         modifier,
-        Brush.linearGradient(listOf(Color(0xB5293C69), Color(0xA9493A66), Color(0x988B526B)))
+        Brush.linearGradient(listOf(Color(0x25293C69), Color(0x25493A66), Color(0x258B526B)))
     ) {
         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Row(verticalAlignment = Alignment.Bottom) {
-                Text(clock.format(DateTimeFormatter.ofPattern("h:mm")), color = white, fontSize = 68.sp, fontWeight = FontWeight.Bold)
+                Text(clock.format(DateTimeFormatter.ofPattern("h:mm")), color = white, fontSize = if (LocalCompact.current) 44.sp else 58.sp, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.width(8.dp))
-                Text(clock.format(DateTimeFormatter.ofPattern("a")), color = white, fontSize = 30.sp, fontWeight = FontWeight.SemiBold)
+                Text(clock.format(DateTimeFormatter.ofPattern("a")), color = white, fontSize = 19.sp, fontWeight = FontWeight.SemiBold)
             }
             Text(clock.format(DateTimeFormatter.ofPattern("EEE, d MMM yyyy")), color = muted, fontSize = 19.sp)
         }
@@ -546,33 +681,26 @@ private fun ClockCard(modifier: Modifier, clock: LocalDateTime) {
 }
 
 @Composable
-private fun WeatherCard(modifier: Modifier, weather: String) {
-    val temperature = weather.substringBefore("·").trim()
-    val location = weather.substringAfter("·", "Kochi").trim()
-    GlassPanel(modifier, Brush.linearGradient(listOf(Color(0xB5283A64), Color(0xA2443A68)))) {
-        Text("☀", color = Color(0xFFFFCC29), fontSize = 62.sp)
-        Spacer(Modifier.width(14.dp))
-        Column {
-            Text(temperature, color = white, fontSize = 48.sp, fontWeight = FontWeight.Bold, maxLines = 1)
-            Text("Partly Cloudy", color = muted, fontSize = 17.sp)
-            Text("⌖  $location, Kerala", color = white.copy(alpha = .88f), fontSize = 14.sp)
-        }
-        Spacer(Modifier.weight(1f))
-        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Text("↑  31°C", color = white, fontSize = 14.sp)
-            Text("↓  24°C", color = white, fontSize = 14.sp)
+private fun WeatherCard(modifier: Modifier, weather: Weather?, city: String, status: String) {
+    GlassPanel(modifier, Brush.linearGradient(listOf(Color.Transparent, Color.Transparent))) {
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(weather?.let { "${it.temperature}°C" } ?: "Weather", color = white, fontSize = 30.sp, fontWeight = FontWeight.Bold)
+            Text(weather?.place ?: city, color = white, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            if (weather != null) {
+                Text("${weather.condition} · ↑ ${weather.high}° · ↓ ${weather.low}°", color = muted, fontSize = 13.sp)
+            }
+            Text(if (status.isBlank()) "Open-Meteo" else status, color = muted, fontSize = 11.sp)
         }
     }
 }
 
 @Composable
-private fun NetworkCard(modifier: Modifier, connected: Boolean) {
-    GlassPanel(modifier, Brush.linearGradient(listOf(Color(0xAE253A62), Color(0xA64C3C69)))) {
+private fun NetworkCard(modifier: Modifier, network: String) {
+    GlassPanel(modifier, Brush.linearGradient(listOf(Color.Transparent, Color.Transparent))) {
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             WifiMark()
-            Text("Wi‑Fi", color = white, fontSize = 21.sp, fontWeight = FontWeight.Bold)
-            Text(if (connected) "Connected" else "Offline", color = if (connected) mint else Color(0xFFFF9A9A), fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-            Text(if (connected) "XRHorizon_5G" else "Check connection", color = muted, fontSize = 12.sp)
+            Text("Network", color = white, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+            Text(network, color = if (network == "Offline") muted else mint, fontSize = 15.sp)
         }
     }
 }
@@ -599,7 +727,7 @@ private fun WifiMark() {
 @Composable
 private fun CalendarCard(modifier: Modifier, clock: LocalDateTime) {
     val today = clock.toLocalDate()
-    GlassPanel(modifier, Brush.linearGradient(listOf(Color(0xAE283B63), Color(0xA5473A66)))) {
+    GlassPanel(modifier, Brush.linearGradient(listOf(Color(0x25283B63), Color(0x25473A66)))) {
         Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text(today.format(DateTimeFormatter.ofPattern("MMMM yyyy")), color = white, fontSize = 19.sp, fontWeight = FontWeight.Bold)
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
@@ -607,7 +735,7 @@ private fun CalendarCard(modifier: Modifier, clock: LocalDateTime) {
                     val date = today.plusDays(offset.toLong())
                     val selected = offset == 0
                     Column(
-                        Modifier.width(34.dp)
+                        Modifier.weight(1f)
                             .clip(RoundedCornerShape(8.dp))
                             .background(if (selected) electricBlue else Color.Transparent)
                             .padding(vertical = 5.dp),
@@ -618,7 +746,6 @@ private fun CalendarCard(modifier: Modifier, clock: LocalDateTime) {
                     }
                 }
             }
-            Text("No upcoming events", color = muted, fontSize = 13.sp)
         }
     }
 }
@@ -628,14 +755,15 @@ private fun GlassPanel(modifier: Modifier, background: Brush, content: @Composab
     Row(
         modifier.fillMaxHeight()
             .clip(RoundedCornerShape(22.dp))
-            .background(background)
+            .background(LocalPanel.current)
+            .background(if (LocalLite.current) Brush.linearGradient(listOf(Color.Transparent, Color.Transparent)) else background)
             .background(
                 Brush.linearGradient(
                     listOf(Color.White.copy(alpha = .10f), Color.Transparent, violet.copy(alpha = .07f))
                 )
             )
             .border(1.dp, panelEdge.copy(alpha = .95f), RoundedCornerShape(22.dp))
-            .padding(horizontal = 24.dp, vertical = 20.dp),
+            .padding(horizontal = 14.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
         content = content
     )
@@ -648,8 +776,15 @@ private fun SectionTitle(text: String) {
 
 @Composable
 private fun AppTile(app: TvApp, favorite: Boolean, onClick: () -> Unit, onLongClick: () -> Unit) {
-    val image = remember(app.packageName) {
-        runCatching { app.artwork?.toBitmap(128, 96)?.asImageBitmap() }.getOrNull()
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val image by produceState<ImageBitmap?>(null, app) {
+        value = withContext(Dispatchers.IO) {
+            runCatching {
+                val pm = context.packageManager
+                val artwork = app.resolveInfo.activityInfo.loadBanner(pm) ?: app.resolveInfo.loadIcon(pm)
+                artwork?.toBitmap(128, 96)?.asImageBitmap()
+            }.getOrNull()
+        }
     }
     FocusSurface(
         modifier = Modifier.width(190.dp).height(122.dp),
@@ -657,9 +792,9 @@ private fun AppTile(app: TvApp, favorite: Boolean, onClick: () -> Unit, onLongCl
         onLongClick = onLongClick
     ) {
         Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
-            if (image != null) {
+            image?.let { artwork ->
                 Image(
-                    bitmap = image,
+                    bitmap = artwork,
                     contentDescription = app.name,
                     modifier = Modifier.size(58.dp).clip(RoundedCornerShape(12.dp)),
                     contentScale = ContentScale.Fit
@@ -684,14 +819,14 @@ private fun AllAppsTile(onClick: () -> Unit) {
 
 @Composable
 private fun InputRow(activity: MainActivity) {
-    val inputs = listOf(
-        Triple("▣", "Live TV", "Channels"),
-        Triple("▱", "HDMI 1", "Gaming / STB"),
-        Triple("▱", "HDMI 2", "Laptop / Console"),
-        Triple("▱", "HDMI 3", "Media"),
-        Triple("●●●", "AV", "Set top box"),
-        Triple("↯", "USB Media", "Movies / Photos"),
-        Triple("◩", "Screen Cast", "Cast from phone")
+    val devices = remember(activity) {
+        activity.tvInputs().filter { it.isPassthroughInput }.associateBy { it.loadLabel(activity).toString() }
+    }
+    val sourceTiles = devices.keys.map { Triple("▱", it, "TV input") }
+        .ifEmpty { listOf(Triple("▱", "HDMI / AV", "Use remote Input or Source")) }
+    val inputs = listOf(Triple("▣", "Live TV", "Channels")) + sourceTiles + listOf(
+        Triple("↯", "USB Media", "Open a media file"),
+        Triple("◩", "Screen Cast", "Device casting settings")
     )
     LazyRow(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
         items(inputs) { (icon, label, detail) ->
@@ -699,14 +834,11 @@ private fun InputRow(activity: MainActivity) {
                 modifier = Modifier.width(205.dp).height(94.dp),
                 onClick = {
                     when (label) {
-                        "USB Media" -> runCatching {
-                            activity.startActivity(
-                                Intent(Intent.ACTION_GET_CONTENT).setType("*/*")
-                                    .addCategory(Intent.CATEGORY_OPENABLE)
-                            )
-                        }
-                        "Screen Cast" -> runCatching { activity.startActivity(Intent(Settings.ACTION_CAST_SETTINGS)) }
-                        else -> activity.openTvInput()
+                        "USB Media" -> activity.browseUsb()
+                        "Screen Cast" -> activity.openIntent(Intent(Settings.ACTION_CAST_SETTINGS), "Casting settings are unavailable.")
+                        "Live TV" -> activity.openTvInput()
+                        else -> devices[label]?.let { activity.openTvInput(it) }
+                            ?: activity.feedback("Use the TV remote’s Input or Source button.")
                     }
                 }
             ) {
@@ -725,52 +857,60 @@ private fun InputRow(activity: MainActivity) {
 
 @Composable
 private fun MediaBar(activity: MainActivity) {
-    var metadata by remember { mutableStateOf(activity.currentMedia()) }
-    LaunchedEffect(Unit) {
-        while (true) {
-            metadata = activity.currentMedia()
-            delay(1500)
-        }
+    val sessions = activity.mediaSessions
+    val details = sessions.metadata
+    val description = details?.description
+    val title = description?.title ?: details?.getString(MediaMetadata.METADATA_KEY_TITLE)
+    val artist = details?.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: description?.subtitle
+    val artworkUri = description?.iconUri
+    val loadedArtwork by produceState<ImageBitmap?>(null, artworkUri) {
+        value = null
+        value = decodeArtwork(activity, artworkUri, 256)
     }
-    val artwork = metadata?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
-        ?: metadata?.getBitmap(MediaMetadata.METADATA_KEY_ART)
+    val artwork = remember(description) { description?.iconBitmap?.asImageBitmap() } ?: loadedArtwork
+    val playing = sessions.playback?.state == PlaybackState.STATE_PLAYING
+    val compact = LocalCompact.current
     Row(
         Modifier.fillMaxWidth().height(116.dp)
             .clip(RoundedCornerShape(22.dp))
-            .background(Brush.linearGradient(listOf(Color(0xB823355B), Color(0xA818294A))))
+            .background(LocalPanel.current)
             .background(Brush.linearGradient(listOf(Color.White.copy(alpha = .08f), Color.Transparent)))
             .border(1.dp, panelEdge, RoundedCornerShape(22.dp))
             .padding(16.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Box(
-            Modifier.size(84.dp).clip(RoundedCornerShape(14.dp))
+            Modifier.size(if (compact) 56.dp else 74.dp).clip(RoundedCornerShape(14.dp))
                 .background(Brush.linearGradient(listOf(violet, Color(0xFF1B6DB1), Color(0xFFFF8A78))))
         ) {
             if (artwork != null) {
-                Image(artwork.asImageBitmap(), contentDescription = "Album artwork", modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                Image(artwork, contentDescription = "Album artwork", modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
             } else Text("♫", Modifier.align(Alignment.Center), color = white, fontSize = 34.sp)
         }
         Spacer(Modifier.width(18.dp))
         Column(Modifier.weight(1f)) {
             Text("NOW PLAYING", color = muted, fontSize = 10.sp, letterSpacing = 1.5.sp)
-            Text(metadata?.getString(MediaMetadata.METADATA_KEY_TITLE) ?: "Ready for playback", color = white, fontSize = 20.sp, fontWeight = FontWeight.Bold, maxLines = 1)
-            Text(metadata?.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: "Open a media app to begin", color = muted, fontSize = 13.sp, maxLines = 1)
-            Spacer(Modifier.height(10.dp))
-            Box(Modifier.fillMaxWidth().height(5.dp).clip(RoundedCornerShape(4.dp)).background(Color(0xFF596889)))
+            Text(title?.toString() ?: "No active media", color = white, fontSize = 18.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(artist?.toString() ?: if (sessions.accessGranted) "Open a media app" else "Enable access in Media", color = muted, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
-        Spacer(Modifier.width(22.dp))
-        MediaControl("|◀") { activity.mediaKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS) }
-        Spacer(Modifier.width(12.dp))
-        MediaControl("▶") { activity.mediaKey(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE) }
-        Spacer(Modifier.width(12.dp))
-        MediaControl("▶|") { activity.mediaKey(KeyEvent.KEYCODE_MEDIA_NEXT) }
+        val size = if (compact) 42.dp else 54.dp
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            MediaControl("⏮", "Previous", size) {
+                sessions.control(PlaybackState.ACTION_SKIP_TO_PREVIOUS) { activity.mediaKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS) }
+            }
+            MediaControl(if (playing) "Ⅱ" else "▶", if (playing) "Pause" else "Play", size) {
+                sessions.control(PlaybackState.ACTION_PLAY_PAUSE) { activity.mediaKey(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE) }
+            }
+            MediaControl("⏭", "Next", size) {
+                sessions.control(PlaybackState.ACTION_SKIP_TO_NEXT) { activity.mediaKey(KeyEvent.KEYCODE_MEDIA_NEXT) }
+            }
+        }
     }
 }
 
 @Composable
-private fun MediaControl(label: String, onClick: () -> Unit) {
-    FocusSurface(Modifier.size(62.dp), onClick = onClick, circular = true) {
+private fun MediaControl(label: String, description: String, size: androidx.compose.ui.unit.Dp, onClick: () -> Unit) {
+    FocusSurface(Modifier.size(size).semantics { contentDescription = description }, onClick = onClick, circular = true) {
         Text(label, color = white, fontSize = 18.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
     }
 }
@@ -784,16 +924,18 @@ private fun AppsPage(
     onToggleFavorite: (String) -> Unit
 ) {
     PageTitle("Installed TV Apps", "Long-press OK to add or remove a favorite")
-    apps.chunked(6).forEach { row ->
-        Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
-            row.forEach { app ->
+    ActionTile("↻", "Refresh app list", "Scan for newly installed apps", onRefresh)
+    if (apps.isEmpty()) Text("No launchable apps found.", color = muted)
+    val columns = if (LocalCompact.current) 3 else 5
+    apps.chunked(columns).forEach { row ->
+        LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            items(row, key = { it.packageName }) { app ->
                 AppTile(app, favorites.contains(app.packageName), { activity.openApp(app.packageName) }) {
                     onToggleFavorite(app.packageName)
                 }
             }
         }
     }
-    ActionTile("↻", "Refresh app list", "Scan for newly installed TV apps", onRefresh)
 }
 
 @Composable
@@ -806,7 +948,7 @@ private fun InputsPage(activity: MainActivity) {
         fontSize = 14.sp
     )
     ActionTile("⚙", "Android TV settings", "Open device input and display settings") {
-        activity.startActivity(Intent(Settings.ACTION_SETTINGS))
+        activity.openIntent(Intent(Settings.ACTION_SETTINGS), "Device settings are unavailable.")
     }
 }
 
@@ -814,19 +956,24 @@ private fun InputsPage(activity: MainActivity) {
 private fun MediaPage(activity: MainActivity, apps: List<TvApp>) {
     PageTitle("Media", "Controls are sent to the active Android media session")
     MediaBar(activity)
-    ActionTile("⚙", "Enable Now Playing access", "Allow Nexora to read active media metadata") { activity.requestMediaAccess() }
+    if (!activity.mediaSessions.accessGranted) {
+        ActionTile("⚙", "Enable Now Playing access", "Allow Nexora to read active media metadata") { activity.requestMediaAccess() }
+    }
     val mediaApps = apps.filter { app ->
         listOf("youtube", "music", "spotify", "vlc", "kodi", "plex", "jiosaavn", "wynk", "prime", "netflix")
             .any { it in app.name.lowercase() || it in app.packageName.lowercase() }
     }
     if (mediaApps.isEmpty()) Text("No recognized media apps installed", color = muted)
     mediaApps.chunked(4).forEach { group ->
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            group.forEach { app -> ActionTile("▶", app.name, "Open player") { activity.openApp(app.packageName) } }
+        LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            items(group, key = { it.packageName }) { app ->
+                ActionTile("▶", app.name, "Open player") { activity.openApp(app.packageName) }
+            }
         }
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun WidgetsPage(
     weather: Boolean,
@@ -841,7 +988,7 @@ private fun WidgetsPage(
     onMoveRow: (String, Int) -> Unit
 ) {
     PageTitle("Customize Home", "Choose widgets and arrange the home rows")
-    Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+    FlowRow(horizontalArrangement = Arrangement.spacedBy(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         ToggleTile("☀", "Weather", weather, onWeather)
         ToggleTile("□", "Calendar", calendar, onCalendar)
         ToggleTile("⌁", "Network", network, onNetwork)
@@ -889,7 +1036,7 @@ private fun RowOrderTile(
         Row(
             Modifier.weight(1f).fillMaxHeight()
                 .clip(RoundedCornerShape(18.dp))
-                .background(Brush.linearGradient(listOf(LocalPanel.current, panelStrong.copy(alpha = .72f))))
+                .background(LocalPanel.current)
                 .background(Brush.linearGradient(listOf(Color.White.copy(alpha = .07f), Color.Transparent)))
                 .border(1.dp, panelEdge.copy(alpha = .9f), RoundedCornerShape(18.dp))
                 .padding(horizontal = 20.dp),
@@ -920,6 +1067,9 @@ private fun SettingsPage(
     onWallpaper: () -> Unit,
     onNextWallpaper: () -> Unit,
     onChooseWallpaper: () -> Unit,
+    onResetWallpaper: () -> Unit,
+    opacity: Int,
+    onOpacity: (Int) -> Unit,
     city: String,
     onCityChange: (String) -> Unit,
     onSaveCity: () -> Unit
@@ -943,9 +1093,26 @@ private fun SettingsPage(
         fontSize = 13.sp
     )
     ToggleTile("◈", "Daily background", wallpaperOn, onWallpaper)
+    if (uiMode != "lite") {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Glass opacity: $opacity%", color = white)
+            MediaControl("−", "Decrease glass opacity", 42.dp) { onOpacity(-10) }
+            MediaControl("+", "Increase glass opacity", 42.dp) { onOpacity(10) }
+        }
+    }
     ActionTile("▧", "Choose wallpaper", "Select an image from TV or USB storage", onChooseWallpaper)
+    ActionTile("↶", "Reset wallpaper", "Return to the built-in background", onResetWallpaper)
     SectionTitle("Weather city (no GPS required)")
-    androidx.compose.material3.OutlinedTextField(value = city, onValueChange = onCityChange, label = { Text("City") }, singleLine = true)
+    androidx.compose.material3.OutlinedTextField(
+        value = city,
+        onValueChange = { onCityChange(it.take(80)) },
+        label = { Text("City") },
+        singleLine = true,
+        colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(
+            focusedTextColor = white, unfocusedTextColor = white,
+            focusedLabelColor = neonBlue, unfocusedLabelColor = muted
+        )
+    )
     ActionTile("✓", "Save weather city", "Update the forecast location", onSaveCity)
     ActionTile("↻", "Next background", "Cycle to the next mountain palette", onNextWallpaper)
     Text("Ambient screensaver: select Nexora Ambient in Android TV screensaver settings.", color = muted, fontSize = 13.sp)
@@ -993,13 +1160,6 @@ private fun RemoteHelpBar(onCustomize: () -> Unit) {
         Modifier.fillMaxWidth().height(58.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Text("◆  Navigate with remote", color = white, fontSize = 13.sp)
-        Spacer(Modifier.width(26.dp))
-        Text("OK  Open", color = muted, fontSize = 13.sp)
-        Spacer(Modifier.width(26.dp))
-        Text("☰  Menu / Options", color = muted, fontSize = 13.sp)
-        Spacer(Modifier.width(26.dp))
-        Text("↶  Back", color = muted, fontSize = 13.sp)
         Spacer(Modifier.weight(1f))
         FocusSurface(Modifier.width(220.dp).height(50.dp), onClick = onCustomize) {
             Text("✎  Customize Layout", color = white, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
@@ -1014,23 +1174,24 @@ private fun FocusSurface(
     selected: Boolean = false,
     circular: Boolean = false,
     onClick: () -> Unit,
-    onLongClick: () -> Unit = {},
+    onLongClick: (() -> Unit)? = null,
     content: @Composable () -> Unit
 ) {
     var focused by remember { mutableStateOf(false) }
+    val lite = LocalLite.current
     val shape = if (circular) RoundedCornerShape(50) else RoundedCornerShape(18.dp)
     val fill = if (focused || selected) {
         Brush.linearGradient(listOf(Color(0xD5345897), Color(0xCF2A3D75), Color(0xC76B3E86)))
     } else {
-        Brush.linearGradient(listOf(LocalPanel.current, panelStrong.copy(alpha = .78f)))
+        Brush.linearGradient(listOf(LocalPanel.current, LocalPanel.current))
     }
     Box(
         modifier
             .graphicsLayer {
-                scaleX = if (focused) 1.035f else 1f
-                scaleY = if (focused) 1.035f else 1f
+                scaleX = if (focused && !lite) 1.035f else 1f
+                scaleY = if (focused && !lite) 1.035f else 1f
             }
-            .shadow(if (focused) 14.dp else 0.dp, shape, clip = false)
+            .shadow(if (focused && !lite) 10.dp else 0.dp, shape, clip = false)
             .onFocusChanged { focused = it.isFocused }
             .clip(shape)
             .background(fill)
@@ -1053,11 +1214,7 @@ private fun MountainBackdrop(palette: List<Color>) {
         Image(
             painter = painterResource(R.drawable.nexora_mountain_sunset),
             contentDescription = null,
-            modifier = Modifier.fillMaxSize().graphicsLayer {
-                scaleX = 1.35f
-                scaleY = 1.35f
-                translationY = -280f
-            },
+            modifier = Modifier.fillMaxSize(),
             contentScale = ContentScale.Crop
         )
         Canvas(Modifier.fillMaxSize()) {
@@ -1066,8 +1223,8 @@ private fun MountainBackdrop(palette: List<Color>) {
                     listOf(
                         palette[0].copy(alpha = .18f),
                         Color.Transparent,
-                        midnight.copy(alpha = .32f),
-                        midnight.copy(alpha = .82f)
+                        palette[2].copy(alpha = .25f),
+                        midnight.copy(alpha = .70f)
                     )
                 )
             )
@@ -1080,7 +1237,15 @@ private fun MountainBackdrop(palette: List<Color>) {
     }
 }
 
-private fun isConnected(activity: Activity): Boolean {
+private fun isConnected(activity: Activity): Boolean = networkLabel(activity) != "Offline"
+
+private fun networkLabel(activity: Activity): String {
     val connectivity = activity.getSystemService(ConnectivityManager::class.java)
-    return connectivity.activeNetwork != null
+    val capabilities = connectivity.getNetworkCapabilities(connectivity.activeNetwork) ?: return "Offline"
+    return when {
+        capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "Wi-Fi connected"
+        capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "Ethernet connected"
+        capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) -> "Connected"
+        else -> "Offline"
+    }
 }
