@@ -19,7 +19,6 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.windowInsetsPadding
-import androidx.compose.runtime.produceState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.core.view.WindowCompat
@@ -391,9 +390,9 @@ fun LauncherScreen(activity: MainActivity) {
     }
 
     val wallpaperUri = if (uiMode == "lite") null else activity.wallpaperUri
-    val customWallpaper by produceState<ImageBitmap?>(null, wallpaperUri) {
-        value = null
-        value = decodeArtwork(activity, wallpaperUri, 1920)
+    var customWallpaper by remember(wallpaperUri) { mutableStateOf<ImageBitmap?>(null) }
+    LaunchedEffect(wallpaperUri) {
+        customWallpaper = decodeArtwork(activity, wallpaperUri, 1920)
     }
     BoxWithConstraints(Modifier.fillMaxSize().background(midnight)) {
         val compact = maxWidth < 1050.dp
@@ -783,8 +782,9 @@ private fun SectionTitle(text: String) {
 @Composable
 private fun AppTile(app: TvApp, favorite: Boolean, onClick: () -> Unit, onLongClick: () -> Unit) {
     val context = androidx.compose.ui.platform.LocalContext.current
-    val image by produceState<ImageBitmap?>(null, app) {
-        value = withContext(Dispatchers.IO) {
+    var image by remember(app) { mutableStateOf<ImageBitmap?>(null) }
+    LaunchedEffect(app, context) {
+        image = withContext(Dispatchers.IO) {
             runCatching {
                 val pm = context.packageManager
                 val artwork = app.resolveInfo.activityInfo.loadBanner(pm) ?: app.resolveInfo.loadIcon(pm)
@@ -876,9 +876,9 @@ private fun MediaBar(activity: MainActivity) {
     val title = description?.title ?: details?.getString(MediaMetadata.METADATA_KEY_TITLE)
     val artist = details?.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: description?.subtitle
     val artworkUri = description?.iconUri
-    val loadedArtwork by produceState<ImageBitmap?>(null, artworkUri) {
-        value = null
-        value = decodeArtwork(activity, artworkUri, 256)
+    var loadedArtwork by remember(artworkUri) { mutableStateOf<ImageBitmap?>(null) }
+    LaunchedEffect(artworkUri) {
+        loadedArtwork = decodeArtwork(activity, artworkUri, 256)
     }
     val artwork = remember(description) { description?.iconBitmap?.asImageBitmap() } ?: loadedArtwork
     val playing = sessions.playback?.state == PlaybackState.STATE_PLAYING
