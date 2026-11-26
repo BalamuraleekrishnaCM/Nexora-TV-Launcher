@@ -85,6 +85,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -522,7 +523,7 @@ fun LauncherScreen(activity: MainActivity) {
 @Composable
 private fun LauncherHeader(page: String, clock: LocalDateTime, connected: Boolean, onPage: (String) -> Unit) {
     val initialFocus = remember { FocusRequester() }
-    LaunchedEffect(Unit) { initialFocus.requestFocus() }
+    var initialFocusRequested by remember { mutableStateOf(false) }
     val tabs = listOf(
         "⌂" to "Home",
         "▦" to "Apps",
@@ -544,11 +545,17 @@ private fun LauncherHeader(page: String, clock: LocalDateTime, connected: Boolea
         }
         LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             items(tabs, key = { it.second }) { (icon, label) ->
-                NavButton(
-                    icon, label, selected = page == label,
-                    modifier = if (label == "Home") Modifier.focusRequester(initialFocus) else Modifier,
-                    onClick = { onPage(label) }
-                )
+                val modifier = if (label == "Home") {
+                    Modifier.focusRequester(initialFocus).onGloballyPositioned {
+                        if (!initialFocusRequested) {
+                            initialFocusRequested = true
+                            initialFocus.requestFocus()
+                        }
+                    }
+                } else {
+                    Modifier
+                }
+                NavButton(icon, label, selected = page == label, modifier = modifier, onClick = { onPage(label) })
             }
         }
     }
