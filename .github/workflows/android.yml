@@ -42,6 +42,8 @@ jobs:
           sdk_tools="$ANDROID_HOME/cmdline-tools/latest/bin"
           image='system-images;android-34;android-tv;x86'
           "$sdk_tools/sdkmanager" 'emulator' "$image"
+          export PATH="$ANDROID_HOME/platform-tools:$PATH"
+          adb start-server
           export ANDROID_AVD_HOME="$RUNNER_TEMP/nexora-avds"
           avd="$ANDROID_AVD_HOME/nexora-tv-test.avd"
           mkdir -p "$avd"
