@@ -1,4 +1,4 @@
-name: Android debug build
+name: Android build and tests
 on:
   push:
   pull_request:
@@ -22,10 +22,74 @@ jobs:
           echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0" "platform-tools"
-      - name: Compile debug APK
-        run: gradle :app:assembleDebug --stacktrace
+      - name: Run checks and assemble APKs
+        run: gradle :app:testDebugUnitTest :app:lintDebug :app:assembleDebug :app:assembleRelease :app:assembleDebugAndroidTest --stacktrace
       - uses: actions/upload-artifact@v4
         if: success()
         with:
           name: nexora-debug-apk
           path: app/build/outputs/apk/debug/*.apk
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: nexora-unsigned-release-apk
+          path: app/build/outputs/apk/release/*-unsigned.apk
+
+      - name: Run D-pad smoke test on Android TV
+        timeout-minutes: 12
+        run: |
+          sudo chmod a+rw /dev/kvm
+          sdk_tools="$ANDROID_HOME/cmdline-tools/latest/bin"
+          image='system-images;android-34;android-tv;x86'
+          "$sdk_tools/sdkmanager" 'emulator' "$image"
+          export PATH="$ANDROID_HOME/platform-tools:$PATH"
+          adb start-server
+          export ANDROID_AVD_HOME="$RUNNER_TEMP/nexora-avds"
+          avd="$ANDROID_AVD_HOME/nexora-tv-test.avd"
+          mkdir -p "$avd"
+          cat > "$ANDROID_AVD_HOME/nexora-tv-test.ini" <<EOF
+          avd.ini.encoding=UTF-8
+          path=$avd
+          target=android-34
+          EOF
+          cat > "$avd/config.ini" <<'EOF'
+          AvdId=nexora-tv-test
+          abi.type=x86
+          disk.dataPartition.size=1G
+          hw.cpu.arch=x86
+          hw.cpu.ncore=2
+          hw.dPad=yes
+          hw.gpu.enabled=yes
+          hw.initialOrientation=landscape
+          hw.keyboard=yes
+          hw.lcd.density=213
+          hw.lcd.height=720
+          hw.lcd.width=1280
+          hw.ramSize=1536
+          image.sysdir.1=system-images/android-34/android-tv/x86/
+          tag.display=Android TV
+          tag.id=android-tv
+          EOF
+          "$ANDROID_HOME/emulator/emulator" -avd nexora-tv-test -no-window -no-audio -no-boot-anim -no-snapshot -no-metrics -gpu swiftshader_indirect > "$RUNNER_TEMP/nexora-emulator.log" 2>&1 &
+          emulator_pid=$!
+          trap 'kill "$emulator_pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 100); do
+            if ! kill -0 "$emulator_pid"; then
+              tail -80 "$RUNNER_TEMP/nexora-emulator.log"
+              exit 1
+            fi
+            if [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ]; then
+              break
+            fi
+            sleep 3
+          done
+          test "$(adb shell getprop sys.boot_completed | tr -d '\r')" = 1
+          adb shell input keyevent 82
+          gradle :app:connectedDebugAndroidTest --stacktrace
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: nexora-emulator-diagnostics
+          path: |
+            ${{ runner.temp }}/nexora-emulator.log
+            app/build/reports/androidTests/

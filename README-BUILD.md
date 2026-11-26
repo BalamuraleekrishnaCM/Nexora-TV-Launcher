@@ -1,25 +1,22 @@
-# Build status
+# Build Nexora TV Launcher
 
-This is an initial runnable **pre-alpha** Android TV source project, not the full final product.
+Use Android SDK 35, JDK 17 and Gradle 8.9. Open the project in Android Studio or build it from the repository root.
 
-## Build
+```sh
+gradle :app:testDebugUnitTest :app:lintDebug :app:assembleDebug :app:assembleRelease
+gradle :app:connectedDebugAndroidTest
+```
 
-Install Android Studio with Android SDK 35, JDK 17 and Gradle 8.9, then open the root folder and build `:app:assembleDebug`. The repository intentionally does not contain a generated Gradle wrapper; the CI workflow installs Gradle 8.9 explicitly.
+The second command requires a connected Android TV device or emulator. Install the debug build with `adb install -r app/build/outputs/apk/debug/app-debug.apk`.
 
-## Current implementation
+## Android TV verification
 
-- Compose-based TV home with D-pad focusable tiles
-- Clock/date, local calendar date and basic network state
-- Open-Meteo weather for a temporary Kochi coordinate (not user-configurable yet)
-- Installed leanback app discovery, launch and favorite-by-long-press
-- Live TV/source fallback shortcut, USB picker and casting settings shortcut
-- Dark/light toggle and weather visibility preference
-- Minimal Android DreamService clock screensaver
+- Use the D-pad, OK and Back through Home, Apps, Inputs, Media, Widgets and Settings at 720p and 1080p. Check focus and scrolling at your TV's display size.
+- Install a TV app and a sideloaded app with launcher activities. Refresh the app list, open both and long-press OK on a tile to toggle its favorite.
+- Pick a large image from local or USB storage. Relaunch Nexora, reset the wallpaper and check Lite, Balanced and Premium modes.
+- Save a weather city, check the returned region and forecast, then disconnect networking and verify cached conditions.
+- Enable Nexora in notification access and play media. Check title, artist, artwork and supported transport actions. Revoke access and check the fallback.
+- Open each detected TV input. Use the remote Input or Source key on firmware that does not expose a compatible handler.
+- Select Nexora Ambient in system screensaver settings where the TV exposes third-party screensavers.
 
-## Not yet implemented
-
-Daily wallpaper rotation, real HDMI port discovery/switching, real media playback controls, configurable location, full calendar events, custom widget arrangement, production-grade artwork, weather caching, remote hardware testing, signing and production APK release.
-
-## Important limitations
-
-Android TV OEMs may restrict choosing a third-party launcher or DreamService. The TV/source button fallback is device-dependent. No system privileges are used. The application has not been compiled in this environment; CI results are the source of build validation.
+The debug APK is signed for testing. The release build is unsigned. An in-place upgrade of an existing installation requires the original signing certificate.

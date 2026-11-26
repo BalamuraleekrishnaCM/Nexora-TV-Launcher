@@ -2,7 +2,7 @@
 
 A lightweight, minimalist, customizable Android TV / Google TV home launcher by **Balamuraleekrishna C.M.**
 
-> **Status:** Planning / pre-alpha. No installable APK or production-ready launcher is available yet.
+> The Android TV launcher is available as source and through [GitHub Releases](https://github.com/BalamuraleekrishnaCM/Nexora-TV-Launcher/releases).
 
 ## Vision
 
@@ -83,7 +83,7 @@ This is a target structure, not a claim that these modules already exist.
 
 ## Build and installation
 
-The Android Studio project has **not yet been committed**. Once v0.1.0 lands:
+Use Android SDK 35, JDK 17 and Gradle 8.9. See [build and test instructions](README-BUILD.md).
 
 1. Clone: `git clone https://github.com/BalamuraleekrishnaCM/Nexora-TV-Launcher.git`
 2. Open in Android Studio and sync Gradle.
@@ -107,6 +107,6 @@ Issues and pull requests are welcome once the initial source is available. Pleas
 
 ## License
 
-MIT license planned; add a LICENSE file before distributing source under that license.
+[MIT](LICENSE).
 
 **Maintainer:** [BalamuraleekrishnaCM](https://github.com/BalamuraleekrishnaCM)
