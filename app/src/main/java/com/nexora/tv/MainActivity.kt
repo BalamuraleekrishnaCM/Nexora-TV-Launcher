@@ -109,12 +109,14 @@ class MainActivity : ComponentActivity() {
     fun chooseWallpaper() = wallpaperPicker.launch(arrayOf("image/*"))
     fun wallpaperUri(): Uri? = selectedWallpaper ?: getSharedPreferences("nexora", MODE_PRIVATE)
         .getString("wallpaper_uri", null)?.let(Uri::parse)
-    fun currentMedia(): MediaMetadata? = runCatching {
+    private fun activeController(): android.media.session.MediaController? = runCatching {
         val manager = getSystemService(MEDIA_SESSION_SERVICE) as MediaSessionManager
         val component = ComponentName(this, NexoraNotificationListener::class.java)
-        manager.getActiveSessions(component).firstOrNull { it.playbackState?.state == 3 }?.metadata
-            ?: manager.getActiveSessions(component).firstOrNull()?.metadata
+        val sessions = manager.getActiveSessions(component)
+        sessions.firstOrNull { it.playbackState?.state == android.media.session.PlaybackState.STATE_PLAYING }
+            ?: sessions.firstOrNull()
     }.getOrNull()
+    fun currentMedia(): MediaMetadata? = activeController()?.metadata
     fun requestMediaAccess() = runCatching {
         startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
     }
@@ -148,9 +150,17 @@ class MainActivity : ComponentActivity() {
     }
 
     fun mediaKey(code: Int) {
-        val audio = getSystemService(AUDIO_SERVICE) as AudioManager
-        audio.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, code))
-        audio.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, code))
+        val controller = activeController()
+        val handled = runCatching {
+            controller != null && controller.dispatchMediaButtonEvent(KeyEvent(KeyEvent.ACTION_DOWN, code)).also {
+                controller.dispatchMediaButtonEvent(KeyEvent(KeyEvent.ACTION_UP, code))
+            }
+        }.getOrDefault(false)
+        if (!handled) {
+            val audio = getSystemService(AUDIO_SERVICE) as AudioManager
+            audio.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, code))
+            audio.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, code))
+        }
     }
 
     fun openTvInput() {
@@ -226,13 +236,14 @@ fun LauncherScreen(activity: MainActivity) {
     }
     LaunchedEffect(showWeather, city, weatherRefresh) {
         if (showWeather) {
-            val cached = prefs.getString("weather_cache", null)
-            if (cached != null) weather = cached
+            val cachedCity = prefs.getString("weather_cache_city", null)
+            val cached = prefs.getString("weather_cache", null).takeIf { cachedCity == city }
+            weather = cached ?: "Weather unavailable"
             val lastFetch = prefs.getLong("weather_last_fetch", 0L)
-            if (cached != null && System.currentTimeMillis() - lastFetch < 60 * 60 * 1000L) {
+            if (WeatherCache.canReuse(cachedCity, city, cached, lastFetch, System.currentTimeMillis(), weatherRefresh > 0)) {
                 return@LaunchedEffect
             }
-            weather = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            val fresh = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                 runCatching {
                     val query = java.net.URLEncoder.encode(city, "UTF-8")
                     val geo = URL("https://geocoding-api.open-meteo.com/v1/search?name=$query&count=1").openConnection().apply {
@@ -250,10 +261,12 @@ fun LauncherScreen(activity: MainActivity) {
                     }
                     val body = connection.getInputStream().bufferedReader().use { it.readText() }
                     "${JSONObject(body).getJSONObject("current").getDouble("temperature_2m").toInt()}°C · $city"
-                }.getOrDefault(cached ?: "Weather unavailable")
+                }.getOrNull()
             }
-            if (weather != "Weather unavailable") {
+            weather = fresh ?: cached ?: "Weather unavailable"
+            if (fresh != null) {
                 prefs.edit()
+                    .putString("weather_cache_city", city)
                     .putString("weather_cache", weather)
                     .putLong("weather_last_fetch", System.currentTimeMillis())
                     .apply()
